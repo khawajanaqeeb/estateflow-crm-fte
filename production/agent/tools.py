@@ -1,427 +1,481 @@
 """
 EstateFlow Customer Success FTE — Production Tools
-Converted from MCP server tools to OpenAI Agents SDK @function_tool functions.
+OpenAI Agents SDK @function_tool definitions wired to PostgreSQL via queries.py.
 
-Key differences from MCP prototype:
-- Pydantic BaseModel for strict input validation
-- Try/catch with graceful fallbacks on every tool
-- PostgreSQL connection pool (asyncpg) instead of in-memory store
-- Structured logging instead of print statements
-- Detailed docstrings written for LLM consumption
+Phase 2 upgrade from prototype stubs:
+  search_knowledge_base  → asyncpg + pgvector cosine similarity
+  create_ticket          → INSERT INTO tickets + conversations
+  get_customer_history   → SELECT from customers + messages (cross-channel)
+  get_session_context    → SELECT last 10 turns for active conversation
+  escalate_to_human      → UPDATE ticket + publish to fte.escalations Kafka topic
+  send_response          → formatter + Gmail API / Twilio / DB store
+  update_ticket_status   → UPDATE tickets SET status
+  detect_upsell_signal   → in-memory rule engine (no DB needed)
+  analyze_sentiment      → in-memory classifier (no DB needed)
 """
 
+import json
 import logging
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Optional
-from pydantic import BaseModel
+
 from agents import function_tool
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
-
-# ── Note on testability ───────────────────────────────────────────────────────
-# Each tool is implemented as a private async function (_impl suffix) and then
-# wrapped with @function_tool for the agent. Tests call the _impl functions
-# directly, bypassing the FunctionTool wrapper.
 
 
 # ── Input schemas ─────────────────────────────────────────────────────────────
 
 class KnowledgeSearchInput(BaseModel):
-    """Input schema for knowledge base search."""
     query: str
     max_results: int = 5
     category: Optional[str] = None
 
 
 class CreateTicketInput(BaseModel):
-    """Input schema for ticket creation."""
     customer_id: str
     issue: str
-    priority: str        # low | medium | high | urgent
-    channel: str         # email | whatsapp | web_form
+    priority: str = "medium"   # low | medium | high | urgent
+    channel: str               # email | whatsapp | web_form
+    category: Optional[str] = None
 
 
 class CustomerHistoryInput(BaseModel):
-    """Input schema for customer history retrieval."""
     email: Optional[str] = None
     phone: Optional[str] = None
 
 
 class SessionContextInput(BaseModel):
-    """Input schema for session context retrieval."""
     customer_id: str
+    conversation_id: Optional[str] = None
 
 
 class EscalateInput(BaseModel):
-    """Input schema for human escalation."""
     ticket_id: str
     reason: str
-    level: str           # L1 | L2 | L3 | L4
+    level: str              # L1 | L2 | L3 | L4
     context_summary: str
     rule_triggered: Optional[str] = None
 
 
 class SendResponseInput(BaseModel):
-    """Input schema for sending a response."""
     ticket_id: str
     message: str
-    channel: str         # email | whatsapp | web_form
+    channel: str            # email | whatsapp | web_form
     customer_name: Optional[str] = None
+    customer_email: Optional[str] = None
+    customer_phone: Optional[str] = None
+    thread_id: Optional[str] = None
 
 
 class UpdateTicketInput(BaseModel):
-    """Input schema for ticket status update."""
     ticket_id: str
-    status: str          # resolved | pending | open
+    status: str             # resolved | pending | open | closed
     resolution_notes: Optional[str] = None
 
 
 class UpsellSignalInput(BaseModel):
-    """Input schema for upsell signal detection."""
     message: str
-    current_plan: str    # starter | professional | team | brokerage
+    current_plan: str       # starter | professional | team | brokerage
 
 
 class SentimentInput(BaseModel):
-    """Input schema for sentiment analysis."""
     message: str
 
 
-# ── Tools ─────────────────────────────────────────────────────────────────────
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+async def _generate_embedding(text: str) -> Optional[list[float]]:
+    """Generate an embedding vector using OpenAI text-embedding-3-small."""
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        resp = await client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text,
+        )
+        return resp.data[0].embedding
+    except Exception as e:
+        logger.warning("Embedding generation failed — falling back to keyword search: %s", e)
+        return None
+
+
+def _format_search_results(results: list[dict]) -> str:
+    if not results:
+        return (
+            "No relevant documentation found for this query. "
+            "Consider escalating to human support if the customer needs an answer."
+        )
+    parts = []
+    for r in results:
+        score = float(r.get("similarity", 0))
+        parts.append(f"**{r['title']}** (relevance: {score:.2f})\n{r['content'][:600]}")
+    return "\n\n---\n\n".join(parts)
+
+
+def _format_customer_history(rows: list[dict]) -> str:
+    if not rows:
+        return json.dumps({
+            "status": "new_customer",
+            "message": "No prior interactions found.",
+            "prior_messages": [],
+        })
+    formatted = [
+        {
+            "channel":    r["channel"],
+            "role":       r["role"],
+            "content":    r["content"][:300],
+            "created_at": str(r["created_at"]),
+        }
+        for r in rows
+    ]
+    return json.dumps({
+        "status":         "returning_customer",
+        "prior_messages": formatted,
+        "message_count":  len(rows),
+    })
+
+
+_SLA_MAP = {
+    "L1": "Next business day",
+    "L2": "Within 4 business hours",
+    "L3": "Within 1 hour",
+    "L4": "Immediate (24/7 on-call)",
+}
+
+_SLA_OFFSETS = {
+    "L1": timedelta(days=1),
+    "L2": timedelta(hours=4),
+    "L3": timedelta(hours=1),
+    "L4": timedelta(minutes=15),
+}
+
+_ESCALATION_ROUTES = [
+    (("billing", "refund", "charge", "invoice"),          "billing@estateflow.io"),
+    (("security", "unauthorized", "hacked", "breach"),    "security@estateflow.io"),
+    (("legal", "compliance", "gdpr", "ccpa", "privacy"),  "privacy@estateflow.io"),
+    (("pricing", "discount", "negotiate", "contract"),    "sales@estateflow.io"),
+]
+
+
+def _route_escalation(reason: str) -> str:
+    r = reason.lower()
+    for keywords, dest in _ESCALATION_ROUTES:
+        if any(k in r for k in keywords):
+            return dest
+    return "team@estateflow.io"
+
+
+def _proto_path() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+
+# ── Tool implementations (_impl suffix — called directly by tests) ─────────────
 
 async def _search_knowledge_base_impl(input: KnowledgeSearchInput) -> str:
-    """Search EstateFlow product documentation for relevant information.
-
-    Use this when the customer asks questions about product features,
-    how to use something, needs technical information, or reports an issue
-    that may have a documented solution.
-
-    Args:
-        input: Search parameters including query text and optional category filter.
-
-    Returns:
-        Formatted search results with section names and relevance scores.
-        Returns a helpful message if no results are found.
-    """
     try:
-        import sys, os
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        from src.agent import knowledge_base
+        from production.database.queries import search_knowledge_base_db
 
-        results = knowledge_base.search(input.query, max_results=input.max_results)
+        embedding = await _generate_embedding(input.query)
+        results   = await search_knowledge_base_db(
+            embedding=embedding,
+            max_results=input.max_results,
+            category=input.category,
+        )
+
+        # Fallback to in-memory prototype KB if DB returns nothing
         if not results:
-            return "No relevant documentation found for this query. Consider escalating to human support if the customer needs an answer."
+            import sys
+            sys.path.insert(0, _proto_path())
+            from src.agent import knowledge_base as kb_proto
+            proto = kb_proto.search(input.query, max_results=input.max_results)
+            results = [
+                {"title": r.section, "content": r.content, "similarity": r.score}
+                for r in proto
+            ]
 
-        parts = []
-        for r in results:
-            parts.append(f"**{r.section}** (relevance: {r.score})\n{r.content}")
-        return "\n\n---\n\n".join(parts)
+        return _format_search_results(results)
 
     except Exception as e:
-        logger.error(f"Knowledge base search failed: {e}")
-        return "Knowledge base temporarily unavailable. Please try again or escalate to human support."
+        logger.error("search_knowledge_base failed: %s", e)
+        # Final fallback: prototype KB without DB
+        try:
+            import sys
+            sys.path.insert(0, _proto_path())
+            from src.agent import knowledge_base as kb_proto
+            results = kb_proto.search(input.query, max_results=input.max_results)
+            if results:
+                return _format_search_results([
+                    {"title": r.section, "content": r.content, "similarity": r.score}
+                    for r in results
+                ])
+        except Exception:
+            pass
+        return "Knowledge base temporarily unavailable. Please escalate if the customer needs an immediate answer."
 
 
 async def _create_ticket_impl(input: CreateTicketInput) -> str:
-    """Create a support ticket to log a customer interaction.
-
-    ALWAYS call this as the very first tool before sending any response.
-    Every customer interaction must be logged with a ticket.
-    The returned ticket_id must be used in all subsequent tool calls.
-
-    Args:
-        input: Ticket details including customer_id, issue summary, priority, and channel.
-
-    Returns:
-        JSON string with ticket_id, status, and creation timestamp.
-    """
     try:
-        import json, uuid
-        from datetime import datetime
+        from production.database.queries import (
+            get_active_conversation,
+            create_conversation,
+            create_ticket_record,
+        )
 
-        # Production: insert into PostgreSQL tickets table via asyncpg
-        # Prototype: return simulated ticket
-        ticket_id = "TKT-" + str(uuid.uuid4())[:6].upper()
-        result = {
-            "ticket_id": ticket_id,
-            "customer_id": input.customer_id,
-            "channel": input.channel,
-            "priority": input.priority,
-            "status": "open",
-            "created_at": datetime.utcnow().isoformat(),
-        }
-        logger.info(f"Ticket created: {ticket_id} for customer {input.customer_id}")
-        return json.dumps(result)
+        conv = await get_active_conversation(input.customer_id)
+        conversation_id = str(conv["id"]) if conv else await create_conversation(
+            input.customer_id, input.channel
+        )
+
+        ticket_id = await create_ticket_record(
+            conversation_id=conversation_id,
+            customer_id=input.customer_id,
+            source_channel=input.channel,
+            category=input.category,
+            priority=input.priority,
+        )
+
+        logger.info("Ticket created: %s (customer=%s channel=%s)", ticket_id, input.customer_id, input.channel)
+        return json.dumps({
+            "ticket_id":       ticket_id,
+            "conversation_id": conversation_id,
+            "customer_id":     input.customer_id,
+            "channel":         input.channel,
+            "priority":        input.priority,
+            "status":          "open",
+            "created_at":      datetime.now(timezone.utc).isoformat(),
+        })
 
     except Exception as e:
-        logger.error(f"Ticket creation failed: {e}")
-        return '{"error": "Ticket creation failed. Proceeding without ticket ID — log manually."}'
+        logger.error("create_ticket failed: %s", e)
+        return json.dumps({"error": "Ticket creation failed. Proceeding without ticket ID — log manually."})
 
 
 async def _get_customer_history_impl(input: CustomerHistoryInput) -> str:
-    """Retrieve a customer's full interaction history across ALL channels.
-
-    Use this at the start of every conversation to check if this is a returning
-    customer and to understand their prior issues, escalations, and sentiment history.
-    Pass either email (preferred) or phone number to identify the customer.
-
-    Args:
-        input: Customer identifier — at least one of email or phone required.
-
-    Returns:
-        JSON string with customer profile, ticket history, and session history.
-    """
     try:
-        import json
+        from production.database.queries import (
+            find_customer_by_email,
+            find_customer_by_phone,
+            get_customer_full_history,
+        )
 
         if not input.email and not input.phone:
-            return '{"error": "Provide at least one of email or phone to identify the customer."}'
+            return json.dumps({"error": "Provide at least one of email or phone."})
 
-        # Production: query PostgreSQL customers + tickets tables
-        # Prototype: return new customer response
-        identifier = input.email or input.phone
-        return json.dumps({
-            "customer_id": "LOOKUP_REQUIRED",
-            "identifier_used": identifier,
-            "status": "new_customer",
-            "message": "No prior interactions found. This is a new customer.",
-            "prior_tickets": [],
-            "prior_sessions": [],
-        })
+        customer = None
+        if input.email:
+            customer = await find_customer_by_email(input.email)
+        if not customer and input.phone:
+            customer = await find_customer_by_phone(input.phone)
+
+        if not customer:
+            return json.dumps({
+                "status":         "new_customer",
+                "message":        "No prior interactions found. This is a new customer.",
+                "prior_messages": [],
+            })
+
+        history = await get_customer_full_history(str(customer["id"]))
+        return _format_customer_history(history)
 
     except Exception as e:
-        logger.error(f"Customer history retrieval failed: {e}")
-        return '{"error": "Could not retrieve customer history. Proceed as new customer."}'
+        logger.error("get_customer_history failed: %s", e)
+        return json.dumps({"error": "Could not retrieve history. Proceed as new customer."})
 
 
 async def _get_session_context_impl(input: SessionContextInput) -> str:
-    """Retrieve the active conversation session for a customer.
-
-    Use this when a customer sends a follow-up message to avoid making them
-    repeat themselves. Returns prior turns, sentiment trend, topics covered,
-    and whether a channel switch has occurred.
-
-    Args:
-        input: Customer ID to look up the active session.
-
-    Returns:
-        JSON string with session details and prior conversation turns.
-    """
     try:
-        import json
+        from production.database.queries import (
+            get_active_conversation,
+            load_conversation_history,
+        )
 
-        # Production: query PostgreSQL sessions + messages tables
+        conv = await get_active_conversation(input.customer_id)
+        if not conv:
+            return json.dumps({
+                "customer_id":    input.customer_id,
+                "active_session": None,
+                "message":        "No active session. This is the start of a new conversation.",
+                "history":        [],
+            })
+
+        history = await load_conversation_history(str(conv["id"]))
         return json.dumps({
-            "customer_id": input.customer_id,
-            "active_session": None,
-            "message": "No active session. This is the start of a new conversation.",
+            "customer_id":     input.customer_id,
+            "conversation_id": str(conv["id"]),
+            "channel":         conv["initial_channel"],
+            "started_at":      str(conv["started_at"]),
+            "message_count":   len(history),
+            "history": [
+                {"role": m["role"], "content": m["content"][:300], "channel": m["channel"]}
+                for m in history[-10:]
+            ],
         })
 
     except Exception as e:
-        logger.error(f"Session context retrieval failed: {e}")
-        return '{"error": "Could not retrieve session context. Proceed as new conversation."}'
+        logger.error("get_session_context failed: %s", e)
+        return json.dumps({"error": "Could not retrieve session. Proceed as new conversation."})
 
 
 async def _escalate_to_human_impl(input: EscalateInput) -> str:
-    """Escalate a support ticket to a human agent.
-
-    Call this when: the customer requests a human, sentiment is very negative,
-    a billing dispute or refund is requested, data loss is reported, a security
-    incident is suspected, a technical bug persists after 2 troubleshooting attempts,
-    or a brokerage customer has an unresolved issue.
-
-    Always include the full context_summary — the human agent must NOT need to
-    ask the customer to repeat themselves.
-
-    Args:
-        input: Ticket ID, escalation reason, level (L1-L4), and full context summary.
-
-    Returns:
-        JSON string with escalation ID, routing destination, and SLA commitment.
-    """
     try:
-        import json
+        from production.database.queries import update_ticket_record
+        from production.kafka_client import FTEKafkaProducer, TOPICS
 
-        sla_map = {
-            "L1": "Next business day",
-            "L2": "Within 4 business hours",
-            "L3": "Within 1 hour",
-            "L4": "Immediate (24/7 on-call)",
-        }
+        routed_to    = _route_escalation(input.reason)
+        sla          = _SLA_MAP.get(input.level, "Next business day")
+        sla_deadline = (
+            datetime.now(timezone.utc) + _SLA_OFFSETS.get(input.level, timedelta(days=1))
+        ).isoformat()
 
-        def route(reason: str) -> str:
-            r = reason.lower()
-            if any(w in r for w in ["billing", "charge", "refund", "invoice"]):
-                return "billing@estateflow.io"
-            if any(w in r for w in ["security", "unauthorized", "hacked"]):
-                return "security@estateflow.io"
-            if any(w in r for w in ["legal", "compliance", "gdpr"]):
-                return "privacy@estateflow.io"
-            if any(w in r for w in ["pricing", "discount", "negotiate"]):
-                return "sales@estateflow.io"
-            return "team@estateflow.io"
+        await update_ticket_record(
+            ticket_id=input.ticket_id,
+            status="escalated",
+            escalation_level=input.level,
+            escalation_reason=input.reason,
+        )
 
-        result = {
-            "escalation_id": f"ESC-{input.ticket_id}",
-            "ticket_id": input.ticket_id,
-            "level": input.level,
-            "reason": input.reason,
-            "rule_triggered": input.rule_triggered or "Manual escalation",
-            "routed_to": route(input.reason),
-            "sla": sla_map.get(input.level, "Next business day"),
+        event = {
+            "event_type":      "escalation",
+            "ticket_id":       input.ticket_id,
+            "escalation_id":   f"ESC-{input.ticket_id[:8]}",
+            "level":           input.level,
+            "reason":          input.reason,
+            "rule_triggered":  input.rule_triggered or "Manual escalation",
+            "routed_to":       routed_to,
+            "sla":             sla,
+            "sla_deadline":    sla_deadline,
             "context_summary": input.context_summary,
-            "status": "escalated",
         }
-        logger.warning(f"Escalation triggered: {input.ticket_id} | {input.level} | {input.reason}")
-        return json.dumps(result)
+
+        producer = FTEKafkaProducer()
+        await producer.start()
+        await producer.publish(TOPICS["escalations"], event)
+        await producer.stop()
+
+        logger.warning("Escalation: ticket=%s level=%s → %s", input.ticket_id, input.level, routed_to)
+        return json.dumps({**event, "status": "escalated"})
 
     except Exception as e:
-        logger.error(f"Escalation failed: {e}")
-        return '{"error": "Escalation system unavailable. Contact team@estateflow.io directly."}'
+        logger.error("escalate_to_human failed: %s", e)
+        return json.dumps({"error": "Escalation system unavailable. Contact team@estateflow.io directly."})
 
 
 async def _send_response_impl(input: SendResponseInput) -> str:
-    """Send a formatted response to the customer via the appropriate channel.
-
-    ALWAYS call this as the final step. Never reply to the customer without
-    calling this tool. The response is formatted automatically for the target
-    channel (email gets greeting + signature, WhatsApp is trimmed to plain text).
-
-    Args:
-        input: Ticket ID, message text, channel, and optional customer name.
-
-    Returns:
-        JSON string with delivery status and the formatted message that was sent.
-    """
     try:
-        import json, sys, os
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        from src.agent import formatter
-        from src.agent.models import Channel
+        import sys
+        sys.path.insert(0, _proto_path())
+        from src.agent.formatter import format_for_channel
+        from src.agent.models import Channel as Ch
 
-        channel_map = {
-            "email": Channel.EMAIL,
-            "whatsapp": Channel.WHATSAPP,
-            "web_form": Channel.WEB_FORM,
-        }
-        channel = channel_map.get(input.channel, Channel.EMAIL)
-        formatted = formatter.format_for_channel(
+        channel_map  = {"email": Ch.EMAIL, "whatsapp": Ch.WHATSAPP, "web_form": Ch.WEB_FORM}
+        channel_enum = channel_map.get(input.channel, Ch.EMAIL)
+        formatted    = format_for_channel(
             response=input.message,
-            channel=channel,
+            channel=channel_enum,
             customer_name=input.customer_name or "",
         )
 
-        # Production: call Gmail API / Twilio / WebSocket based on channel
-        result = {
-            "ticket_id": input.ticket_id,
-            "channel": input.channel,
-            "status": "delivered",
+        delivery_status = "pending"
+
+        if input.channel == "email" and input.customer_email:
+            from production.channels.gmail_handler import GmailHandler
+            result          = await GmailHandler().send_reply(
+                to_email=input.customer_email,
+                subject="Re: Your EstateFlow Support Request",
+                body=formatted,
+                thread_id=input.thread_id,
+            )
+            delivery_status = result.get("delivery_status", "sent")
+
+        elif input.channel == "whatsapp" and input.customer_phone:
+            from production.channels.whatsapp_handler import WhatsAppHandler
+            result          = await WhatsAppHandler().send_message(
+                to_phone=input.customer_phone,
+                body=formatted,
+            )
+            delivery_status = result.get("delivery_status", "queued")
+
+        else:
+            delivery_status = "stored"   # web_form — customer polls /support/ticket/{id}
+
+        logger.info("Response sent: ticket=%s channel=%s status=%s", input.ticket_id, input.channel, delivery_status)
+        return json.dumps({
+            "ticket_id":         input.ticket_id,
+            "channel":           input.channel,
+            "delivery_status":   delivery_status,
             "formatted_message": formatted,
-        }
-        logger.info(f"Response sent: ticket={input.ticket_id} channel={input.channel}")
-        return json.dumps(result)
+        })
 
     except Exception as e:
-        logger.error(f"send_response failed: {e}")
-        return '{"error": "Response delivery failed. Log the message manually and retry."}'
+        logger.error("send_response failed: %s", e)
+        return json.dumps({"error": "Response delivery failed. Log the message manually and retry."})
 
 
 async def _update_ticket_status_impl(input: UpdateTicketInput) -> str:
-    """Update the status of an existing support ticket.
-
-    Mark as 'resolved' once the customer's issue is fully addressed.
-    Mark as 'pending' if waiting for customer follow-up or human action.
-    Always resolve tickets before ending the conversation.
-
-    Args:
-        input: Ticket ID, new status, and optional resolution notes.
-
-    Returns:
-        JSON string confirming the status update.
-    """
     try:
-        import json
-        from datetime import datetime
+        from production.database.queries import update_ticket_record
 
-        # Production: UPDATE tickets SET status=... WHERE ticket_id=...
-        result = {
-            "ticket_id": input.ticket_id,
-            "status": input.status,
+        await update_ticket_record(
+            ticket_id=input.ticket_id,
+            status=input.status,
+            resolution_notes=input.resolution_notes,
+        )
+        return json.dumps({
+            "ticket_id":        input.ticket_id,
+            "status":           input.status,
             "resolution_notes": input.resolution_notes or "",
-            "updated_at": datetime.utcnow().isoformat(),
-        }
-        logger.info(f"Ticket updated: {input.ticket_id} → {input.status}")
-        return json.dumps(result)
+            "updated_at":       datetime.now(timezone.utc).isoformat(),
+        })
 
     except Exception as e:
-        logger.error(f"Ticket update failed: {e}")
-        return '{"error": "Could not update ticket status."}'
+        logger.error("update_ticket_status failed: %s", e)
+        return json.dumps({"error": "Could not update ticket status."})
 
 
 async def _detect_upsell_signal_impl(input: UpsellSignalInput) -> str:
-    """Detect if a customer is asking about a feature only available on a higher plan.
-
-    Use this after classifying the customer's intent when their plan is known.
-    If an upsell signal is detected, answer the question fully first, then
-    mention the upgrade path in one sentence — do not hard-sell.
-
-    Args:
-        input: The customer's message and their current plan.
-
-    Returns:
-        JSON string with whether a signal was detected, the target plan, and guidance.
-    """
     try:
-        import json, sys, os
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        from src.agent import escalation as esc
+        import sys
+        sys.path.insert(0, _proto_path())
+        from src.agent.escalation import detect_upsell_signal
 
-        is_upsell, target_plan = esc.detect_upsell_signal(input.message, input.current_plan)
+        is_upsell, target_plan = detect_upsell_signal(input.message, input.current_plan)
         plan_prices = {
-            "starter": "$39/mo",
+            "starter":      "$39/mo",
             "professional": "$79/mo",
-            "team": "$149/mo",
-            "brokerage": "Custom pricing",
+            "team":         "$149/mo",
+            "brokerage":    "Custom pricing",
         }
         return json.dumps({
             "upsell_signal_detected": is_upsell,
-            "current_plan": input.current_plan,
-            "target_plan": target_plan,
+            "current_plan":      input.current_plan,
+            "target_plan":       target_plan,
             "target_plan_price": plan_prices.get(target_plan) if target_plan else None,
             "guidance": (
-                f"Answer the question fully first. Then add one sentence: "
+                f"Answer the question fully first. Then add: "
                 f"'This feature is available on our {target_plan.title()} plan "
-                f"({plan_prices.get(target_plan)}). You can upgrade anytime from Settings → Billing.'"
+                f"({plan_prices.get(target_plan)}). Upgrade anytime from Settings → Billing.'"
             ) if is_upsell else "No upsell action needed.",
         })
 
     except Exception as e:
-        logger.error(f"Upsell detection failed: {e}")
-        return '{"upsell_signal_detected": false, "error": "Detection unavailable."}'
+        logger.error("detect_upsell_signal failed: %s", e)
+        return json.dumps({"upsell_signal_detected": False, "error": "Detection unavailable."})
 
 
 async def _analyze_sentiment_impl(input: SentimentInput) -> str:
-    """Analyze the sentiment of a customer message.
-
-    Run this on every incoming message to classify emotional state and
-    inform escalation decisions. Results are also stored in session memory
-    to detect worsening sentiment trends across a conversation.
-
-    Args:
-        input: The customer message to analyze.
-
-    Returns:
-        JSON string with sentiment label, confidence, and tone guidance.
-    """
     try:
-        import json, sys, os
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        import sys
+        sys.path.insert(0, _proto_path())
         from src.agent.agent import _quick_sentiment
         from src.agent.models import Sentiment
 
         sentiment = _quick_sentiment(input.message)
-        negative_states = {Sentiment.FRUSTRATED, Sentiment.NEGATIVE, Sentiment.ANGRY}
+        negative  = {Sentiment.FRUSTRATED, Sentiment.NEGATIVE, Sentiment.ANGRY}
 
-        tone_guidance = {
+        tone_map = {
             Sentiment.POSITIVE.value:   "Customer is positive. Answer directly and warmly.",
             Sentiment.NEUTRAL.value:    "Customer is neutral. Be clear and professional.",
             Sentiment.NEGATIVE.value:   "Customer is dissatisfied. Acknowledge once, then solve.",
@@ -430,67 +484,113 @@ async def _analyze_sentiment_impl(input: SentimentInput) -> str:
         }
 
         return json.dumps({
-            "sentiment": sentiment.value,
-            "is_negative": sentiment in negative_states,
+            "sentiment":          sentiment.value,
+            "is_negative":        sentiment in negative,
             "escalation_advised": sentiment == Sentiment.ANGRY,
-            "tone_guidance": tone_guidance.get(sentiment.value, "Respond professionally."),
+            "tone_guidance":      tone_map.get(sentiment.value, "Respond professionally."),
         })
 
     except Exception as e:
-        logger.error(f"Sentiment analysis failed: {e}")
-        return '{"sentiment": "neutral", "error": "Sentiment analysis unavailable."}'
+        logger.error("analyze_sentiment failed: %s", e)
+        return json.dumps({"sentiment": "neutral", "error": "Sentiment analysis unavailable."})
 
 
-# ── @function_tool decorated wrappers (used by the OpenAI Agents SDK agent) ───
-# Tests call the _impl functions directly; the agent uses these wrappers.
+# ── @function_tool wrappers ───────────────────────────────────────────────────
 
 @function_tool
 async def search_knowledge_base(input: KnowledgeSearchInput) -> str:
-    """Search EstateFlow product documentation for relevant information."""
+    """Search EstateFlow product documentation for relevant information.
+
+    Use this when the customer asks questions about product features,
+    how to use something, reports an issue, or needs technical guidance.
+    """
     return await _search_knowledge_base_impl(input)
+
 
 @function_tool
 async def create_ticket(input: CreateTicketInput) -> str:
-    """Create a support ticket. ALWAYS call this first before responding."""
+    """Create a support ticket. ALWAYS call this first before any response.
+
+    Every customer interaction must be logged. The returned ticket_id must
+    be used in all subsequent tool calls for this conversation.
+    """
     return await _create_ticket_impl(input)
+
 
 @function_tool
 async def get_customer_history(input: CustomerHistoryInput) -> str:
-    """Retrieve a customer's full interaction history across all channels."""
+    """Retrieve a customer's full interaction history across ALL channels.
+
+    Use this at the start of every conversation to check for prior context.
+    Pass email (preferred) or phone to identify the customer.
+    """
     return await _get_customer_history_impl(input)
+
 
 @function_tool
 async def get_session_context(input: SessionContextInput) -> str:
-    """Retrieve the active conversation session for a customer."""
+    """Retrieve the active conversation session for a customer.
+
+    Use this for follow-up messages so the customer doesn't repeat themselves.
+    Returns the last 10 message turns.
+    """
     return await _get_session_context_impl(input)
+
 
 @function_tool
 async def escalate_to_human(input: EscalateInput) -> str:
-    """Escalate a ticket to a human agent with full context."""
+    """Escalate a ticket to a human agent with full context.
+
+    Use when: customer requests human, billing dispute, data loss, security
+    incident, persistent negative sentiment, unresolved bug after 2 attempts,
+    brokerage customer with complex issue, or legal question.
+    Always include the full context_summary.
+    """
     return await _escalate_to_human_impl(input)
+
 
 @function_tool
 async def send_response(input: SendResponseInput) -> str:
-    """Send a formatted response to the customer. ALWAYS call this last."""
+    """Send a formatted response to the customer via their channel.
+
+    ALWAYS call this as the final step. Never reply without this tool.
+    Auto-formats for channel: email gets greeting + signature,
+    WhatsApp gets plain text under 300 chars.
+    """
     return await _send_response_impl(input)
+
 
 @function_tool
 async def update_ticket_status(input: UpdateTicketInput) -> str:
-    """Update the status of a support ticket."""
+    """Update the status of a support ticket.
+
+    Mark as 'resolved' when the issue is fully addressed.
+    Mark as 'pending' when waiting for customer follow-up.
+    Always resolve tickets before ending the conversation.
+    """
     return await _update_ticket_status_impl(input)
+
 
 @function_tool
 async def detect_upsell_signal(input: UpsellSignalInput) -> str:
-    """Detect if a customer needs a feature only available on a higher plan."""
+    """Detect if a customer is asking about a feature only on a higher plan.
+
+    Answer the question fully first, then mention the upgrade in one sentence.
+    Do not hard-sell.
+    """
     return await _detect_upsell_signal_impl(input)
+
 
 @function_tool
 async def analyze_sentiment(input: SentimentInput) -> str:
-    """Analyze the sentiment of a customer message."""
+    """Analyze the sentiment of a customer message.
+
+    Run on every incoming message to classify emotional state and
+    inform escalation decisions.
+    """
     return await _analyze_sentiment_impl(input)
 
 
-# Convenience list for registering all tools with the agent
 ALL_TOOLS = [
     search_knowledge_base,
     create_ticket,
