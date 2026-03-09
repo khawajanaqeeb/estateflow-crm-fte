@@ -268,19 +268,31 @@ async def create_ticket_record(
     source_channel: str,
     category: Optional[str] = None,
     priority: str = "medium",
+    ticket_id: Optional[str] = None,
 ) -> str:
-    """Insert a ticket. Returns ticket_id."""
+    """Insert a ticket. Returns ticket_id. Pass ticket_id to use a pre-specified UUID."""
     pool = await get_db_pool()
     async with pool.acquire() as conn:
-        ticket_id = await conn.fetchval(
-            """
-            INSERT INTO tickets (conversation_id, customer_id, source_channel, category, priority)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id
-            """,
-            conversation_id, customer_id, source_channel, category, priority,
-        )
-        return str(ticket_id)
+        if ticket_id:
+            await conn.execute(
+                """
+                INSERT INTO tickets (id, conversation_id, customer_id, source_channel, category, priority)
+                VALUES ($1::uuid, $2, $3, $4, $5, $6)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                ticket_id, conversation_id, customer_id, source_channel, category, priority,
+            )
+            return ticket_id
+        else:
+            new_id = await conn.fetchval(
+                """
+                INSERT INTO tickets (conversation_id, customer_id, source_channel, category, priority)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+                """,
+                conversation_id, customer_id, source_channel, category, priority,
+            )
+            return str(new_id)
 
 
 async def update_ticket_record(
@@ -300,13 +312,13 @@ async def update_ticket_record(
         await conn.execute(
             """
             UPDATE tickets
-            SET status            = $2,
-                escalation_level  = COALESCE($3, escalation_level),
-                escalation_reason = COALESCE($4, escalation_reason),
-                resolution_notes  = COALESCE($5, resolution_notes),
+            SET status            = $2::varchar,
+                escalation_level  = COALESCE($3::varchar, escalation_level),
+                escalation_reason = COALESCE($4::text, escalation_reason),
+                resolution_notes  = COALESCE($5::text, resolution_notes),
                 sla_deadline      = COALESCE($6, sla_deadline),
                 resolved_at       = CASE WHEN $2 IN ('resolved', 'closed') THEN NOW() ELSE resolved_at END
-            WHERE id = $1
+            WHERE id = $1::uuid
             """,
             ticket_id, status, escalation_level, escalation_reason,
             resolution_notes, sla_deadline,
@@ -314,12 +326,31 @@ async def update_ticket_record(
 
 
 async def get_ticket_by_id(ticket_id: str) -> Optional[dict]:
-    """Return ticket with its messages for status endpoint."""
+    """Return ticket with its messages for status endpoint.
+
+    Looks up by ticket primary key first, then falls back to channel_message_id
+    (web form submissions store the form's UUID as channel_message_id in messages).
+    """
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         ticket = await conn.fetchrow(
-            "SELECT * FROM tickets WHERE id = $1", ticket_id
+            "SELECT * FROM tickets WHERE id = $1::uuid", ticket_id
         )
+
+        # Fallback: web form UUID is stored as channel_message_id in messages
+        if not ticket:
+            ticket = await conn.fetchrow(
+                """
+                SELECT t.* FROM tickets t
+                JOIN conversations c ON c.id = t.conversation_id
+                JOIN messages m ON m.conversation_id = c.id
+                WHERE m.channel_message_id = $1
+                ORDER BY t.created_at DESC
+                LIMIT 1
+                """,
+                ticket_id,
+            )
+
         if not ticket:
             return None
 
@@ -354,6 +385,7 @@ async def search_knowledge_base_db(
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         if embedding:
+            embedding_str = '[' + ','.join(str(x) for x in embedding) + ']'
             rows = await conn.fetch(
                 """
                 SELECT title, content, category,
@@ -363,7 +395,7 @@ async def search_knowledge_base_db(
                 ORDER BY embedding <=> $1::vector
                 LIMIT $3
                 """,
-                embedding, category, max_results,
+                embedding_str, category, max_results,
             )
         else:
             # Fallback: return all rows up to limit (no semantic ranking)

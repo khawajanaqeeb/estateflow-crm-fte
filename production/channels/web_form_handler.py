@@ -71,8 +71,40 @@ async def submit_support_form(submission: SupportFormSubmission):
     4. Returns ticket_id to the customer for status tracking.
     """
     from production.kafka_client import FTEKafkaProducer, TOPICS
+    from production.database.queries import (
+        find_customer_by_email, create_customer, add_customer_identifier,
+        get_active_conversation, create_conversation, create_ticket_record,
+    )
 
     ticket_id = str(uuid.uuid4())
+
+    # Pre-create customer + conversation + ticket so the status endpoint
+    # returns immediately without waiting for the worker to process the message.
+    try:
+        customer = await find_customer_by_email(submission.email)
+        if customer:
+            customer_id = str(customer["id"])
+        else:
+            customer_id = await create_customer(
+                email=submission.email, name=submission.name
+            )
+            await add_customer_identifier(customer_id, "email", submission.email)
+
+        conv = await get_active_conversation(customer_id)
+        conversation_id = str(conv["id"]) if conv else await create_conversation(
+            customer_id, "web_form"
+        )
+
+        await create_ticket_record(
+            conversation_id=conversation_id,
+            customer_id=customer_id,
+            source_channel="web_form",
+            category=submission.category,
+            priority=submission.priority,
+            ticket_id=ticket_id,
+        )
+    except Exception as db_err:
+        logger.warning("Could not pre-create ticket record: %s", db_err)
 
     message_data = {
         "channel":          "web_form",

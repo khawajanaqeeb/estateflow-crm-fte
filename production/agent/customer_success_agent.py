@@ -56,8 +56,8 @@ async def run_agent(
     result = await Runner.run(
         agent_with_context,
         input=messages,
+        max_turns=15,              # prevent runaway tool loops
         run_config=RunConfig(
-            max_turns=15,          # prevent runaway tool loops
             trace_include_sensitive_data=False,
         ),
     )

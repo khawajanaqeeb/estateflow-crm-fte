@@ -19,29 +19,26 @@ Requires the API to be running (docker compose up api) at BASE_URL.
 
 import os
 import pytest
-import asyncio
+import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 
 BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
-@pytest.fixture(scope="module")
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="function")
 async def client():
     """
     Use ASGI transport when running in CI (imports the app directly).
     Falls back to real HTTP when API_BASE_URL is set to a live server.
     """
     if os.getenv("API_BASE_URL"):
-        async with AsyncClient(base_url=BASE_URL, timeout=30) as ac:
-            yield ac
+        ac = AsyncClient(base_url=BASE_URL, timeout=30)
+        yield ac
+        try:
+            await ac.aclose()
+        except Exception:
+            pass
     else:
         from production.api.main import app
         async with AsyncClient(

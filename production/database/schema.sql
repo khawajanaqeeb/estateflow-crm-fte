@@ -190,11 +190,11 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     RETURN CASE level
-        WHEN 'L1' THEN NOW() + INTERVAL '1 business day'
+        WHEN 'L1' THEN NOW() + INTERVAL '1 day'
         WHEN 'L2' THEN NOW() + INTERVAL '4 hours'
         WHEN 'L3' THEN NOW() + INTERVAL '1 hour'
         WHEN 'L4' THEN NOW() + INTERVAL '15 minutes'
-        ELSE NOW() + INTERVAL '1 business day'
+        ELSE NOW() + INTERVAL '1 day'
     END;
 END;
 $$;

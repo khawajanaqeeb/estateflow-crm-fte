@@ -185,34 +185,10 @@ async def _search_knowledge_base_impl(input: KnowledgeSearchInput) -> str:
             category=input.category,
         )
 
-        # Fallback to in-memory prototype KB if DB returns nothing
-        if not results:
-            import sys
-            sys.path.insert(0, _proto_path())
-            from src.agent import knowledge_base as kb_proto
-            proto = kb_proto.search(input.query, max_results=input.max_results)
-            results = [
-                {"title": r.section, "content": r.content, "similarity": r.score}
-                for r in proto
-            ]
-
         return _format_search_results(results)
 
     except Exception as e:
         logger.error("search_knowledge_base failed: %s", e)
-        # Final fallback: prototype KB without DB
-        try:
-            import sys
-            sys.path.insert(0, _proto_path())
-            from src.agent import knowledge_base as kb_proto
-            results = kb_proto.search(input.query, max_results=input.max_results)
-            if results:
-                return _format_search_results([
-                    {"title": r.section, "content": r.content, "similarity": r.score}
-                    for r in results
-                ])
-        except Exception:
-            pass
         return "Knowledge base temporarily unavailable. Please escalate if the customer needs an immediate answer."
 
 
@@ -363,18 +339,54 @@ async def _escalate_to_human_impl(input: EscalateInput) -> str:
         return json.dumps({"error": "Escalation system unavailable. Contact team@estateflow.io directly."})
 
 
+def _format_for_channel(message: str, channel: str, customer_name: str = "") -> str:
+    """Inline channel formatter — avoids importing prototype src package."""
+    import re
+    first_name = customer_name.split()[0] if customer_name else ""
+
+    if channel == "whatsapp":
+        text = re.sub(r'\*\*(.*?)\*\*', r'\1', message)
+        text = re.sub(r'\*(.*?)\*', r'\1', text)
+        text = re.sub(r'#{1,6}\s*', '', text)
+        text = re.sub(r'`(.*?)`', r'\1', text)
+        words = text.split()
+        if len(words) > 80:
+            text = " ".join(words[:80])
+            last = max(text.rfind('.'), text.rfind('!'), text.rfind('?'))
+            if last > len(text) // 2:
+                text = text[:last + 1]
+        if len(text) > 300:
+            text = text[:300].rsplit(' ', 1)[0] + "..."
+        return text.strip()
+
+    lines = message.strip().splitlines()
+    has_greeting = lines and re.match(r'^(hi|hello|dear)\b', lines[0], re.IGNORECASE)
+    parts = []
+    if not has_greeting:
+        parts.append(f"Hi {first_name}," if first_name else "Hi there,")
+        parts.append("")
+    parts.append(message.strip())
+
+    if channel == "email":
+        has_signoff = len(lines) > 1 and re.match(
+            r'^(best|regards|thanks|sincerely|warm)', lines[-1], re.IGNORECASE
+        )
+        if not has_signoff:
+            parts += ["", "Let me know if you have any other questions.", "",
+                      "Best,", "EstateFlow Customer Success", "support@estateflow.io"]
+    else:  # web_form
+        if not any(re.match(r'^(let me know|feel free|reach out|hope that)', l, re.IGNORECASE)
+                   for l in lines[-3:]):
+            parts += ["", "Let me know if you need anything else."]
+
+    return "\n".join(parts)
+
+
 async def _send_response_impl(input: SendResponseInput) -> str:
     try:
-        import sys
-        sys.path.insert(0, _proto_path())
-        from src.agent.formatter import format_for_channel
-        from src.agent.models import Channel as Ch
-
-        channel_map  = {"email": Ch.EMAIL, "whatsapp": Ch.WHATSAPP, "web_form": Ch.WEB_FORM}
-        channel_enum = channel_map.get(input.channel, Ch.EMAIL)
-        formatted    = format_for_channel(
-            response=input.message,
-            channel=channel_enum,
+        formatted = _format_for_channel(
+            message=input.message,
+            channel=input.channel,
             customer_name=input.customer_name or "",
         )
 
