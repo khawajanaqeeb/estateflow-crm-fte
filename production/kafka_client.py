@@ -63,8 +63,6 @@ class FTEKafkaProducer:
             value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
             # Reliable delivery: wait for all in-sync replicas
             acks="all",
-            # Retry transient errors up to 5 times
-            retries=5,
         )
         await self._producer.start()
         logger.info("Kafka producer started — brokers: %s", KAFKA_BOOTSTRAP_SERVERS)
